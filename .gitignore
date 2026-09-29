@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.env
+.env.*
+
+# Local AI models
+model/
+
+# Python environment/cache
+.venv/
+__pycache__/
+*.pyc
+
+# Backup files
+*.bak
