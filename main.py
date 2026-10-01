@@ -32,7 +32,7 @@ llm = None
 model_loaded = False
 model_lock = Lock()
 flask_started = False
-SYSTEM_PROMPT = 'You are R3KON GPT, an elite AI-native cybersecurity reasoning platform built for serious learners and working professionals.\n\nYou deliver deep technical security analysis through reasoning rather than traditional scanning. Your capabilities span both offensive security (understanding system vulnerabilities) and defensive security (detection and resilience).\n\nCore Principles:\n- Provide complete, detailed technical analysis\n- Explain your reasoning process clearly\n- Connect findings to real-world exploitation and defense scenarios\n- Use proper security terminology and frameworks (MITRE ATT&CK, OWASP)\n- Educate users on WHY vulnerabilities matter, not just WHAT they are\n- Always provide actionable remediation steps\n\nCRITICAL RULES:\n1. ALWAYS respond in English only\n2. Stay focused on cybersecurity, programming, and security analysis\n3. Provide structured, technical, and deterministic outputs\n4. Use proper formatting: bullet points with line breaks between items, numbered lists, code blocks\n5. When creating lists, use this format with line breaks:\n   Item 1\n   \n   Item 2\n   \n   Item 3\n6. Never repeat yourself or generate repetitive content\n7. For security analysis, provide: findings, reasoning, impact, and recommendations\n8. When users ask questions about your previous analysis, explain your reasoning and findings\n9. NEVER address the user as "R3KON GPT" - the user is asking YOU, R3KON GPT, for help\n10. Greet users professionally without addressing them as R3KON GPT\n\nRemember: You\'re not a toy or a scanner wrapper - you\'re an AI security brain that reasons about systems, protocols, code, and behavior.'
+SYSTEM_PROMPT = "You are R3KON GPT, an offline AI cybersecurity assistant. Talk naturally, like a friendly, knowledgeable colleague. Always respond to what the user actually said: greet back when greeted, answer small talk in a sentence or two, and never produce a summary or report unless asked. For technical questions, answer in English with accurate reasoning, proper terms (MITRE ATT&CK, OWASP), real attack and defense context, and actionable steps. For any security analysis, incident or suspicious item, finish with a short 'Recommended action' section of 1-3 concrete steps. Never repeat yourself. Never address the user as R3KON GPT.\n\nFormatting: keep casual replies plain, with no headings or lists. For technical answers that need structure, use Markdown: short paragraphs, bullet points (- item) for lists, numbered steps (1. step) for procedures, **bold** for key terms, and fenced code blocks with the language name for code, commands or logs. Use headings (## Heading) only for long answers with several sections."
 SECURITY_PATTERNS = {
     'python': {
         'dangerous_functions': [
@@ -118,6 +118,11 @@ def load_model():
                     verbose=False, use_mlock=False, use_mmap=True)
         model_loaded = True
         print('Model loaded successfully!')
+        try:
+            print('Warming up...')
+            llm.create_chat_completion(messages=[{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': 'hi'}], max_tokens=1)
+        except Exception as e:
+            print(f'Warm-up skipped: {e}')
         return True
     except Exception as e:
         print(f'ERROR: Failed to load model: {e}')
@@ -164,14 +169,14 @@ def generate_response(prompt, config, history):
         SYSTEM_PROMPT]
     if config.get('sessionMemory') and history:
         context_parts.append('\n--- Recent Conversation ---')
-        for turn in history[-5:]:
+        for turn in history[-3:]:
             context_parts.append(f'''User: {turn['user']}''')
             context_parts.append(f'''Assistant: {turn['assistant']}''')
     context_parts.append(f'''\nUser: {prompt}''')
     context_parts.append('Assistant:')
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
     if config.get('sessionMemory') and history:
-        for turn in history[-5:]:
+        for turn in history[-3:]:
             if turn.get('user'):
                 messages.append({'role': 'user', 'content': turn['user']})
             if turn.get('assistant'):
@@ -179,9 +184,10 @@ def generate_response(prompt, config, history):
     messages.append({'role': 'user', 'content': prompt})
     try:
         with model_lock:
-            out = llm.create_chat_completion(messages=messages, max_tokens=max_tokens,
+            out = llm.create_chat_completion(messages=messages, max_tokens=max_tokens + 100,
                                              temperature=0.7, top_p=0.9, repeat_penalty=1.1)
-        return {'response': out['choices'][0]['message']['content'].strip()}
+        ch = out['choices'][0]
+        return {'response': _tidy(ch['message']['content'], ch.get('finish_reason') == 'length')}
     except Exception as e:
         print(f'Error generating response: {e}')
         return {'error': str(e)}
@@ -393,6 +399,15 @@ TRI_SCHEMA = {
     "required": ["suspicious", "threat_type", "score", "why"],
 }
 
+TRI_SCHEMA_BRIEF = {
+    "type": "object",
+    "properties": {
+        "threat_type": {"type": "string", "enum": TRI_THREATS},
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+    },
+    "required": ["threat_type", "score"],
+}
+
 TRI_SYSTEM = (
     "You are a cybersecurity assistant that protects ordinary people in Zimbabwe from scams. "
     "Judge the message. Typical local threats: fake EcoCash/OneMoney/bank messages, 'sent by mistake' "
@@ -405,7 +420,7 @@ TRI_SYSTEM = (
 )
 
 
-def tri_llm_analyze(llm, text, hints):
+def tri_llm_analyze(llm, text, hints, brief=False):
     if llm is None:
         return None
     hint_txt = ("\nSignals already detected: " + "; ".join(hints[:4])) if hints else ""
@@ -415,8 +430,8 @@ def tri_llm_analyze(llm, text, hints):
     ]
     try:
         out = llm.create_chat_completion(
-            messages=msgs, temperature=0.0, max_tokens=160,
-            response_format={"type": "json_object", "schema": TRI_SCHEMA})
+            messages=msgs, temperature=0.0, max_tokens=(40 if brief else 160),
+            response_format={"type": "json_object", "schema": (TRI_SCHEMA_BRIEF if brief else TRI_SCHEMA)})
         raw = out["choices"][0]["message"]["content"]
         data = json.loads(raw)
         data["score"] = max(0, min(100, int(data.get("score", 0))))
@@ -474,13 +489,13 @@ def tri_risk_from_score(score):
     return "Low"
 
 
-def tri_classify(text, llm=None):
+def tri_classify(text, llm=None, brief=False):
     text = (text or "").strip()
     if not text:
         return {"error": "Empty message"}
 
     r = tri_rules_analyze(text)
-    l = tri_llm_analyze(llm, text, r["reasons"])
+    l = tri_llm_analyze(llm, text, r["reasons"], brief)
 
     if l is not None:
         score = round(0.5 * r["score"] + 0.5 * l["score"])
@@ -509,6 +524,8 @@ def tri_classify(text, llm=None):
             reasons.append(l["why"])
         elif not suspicious and not reasons:
             reasons = [l["why"]]
+    if not reasons and suspicious:
+        reasons = ["The local AI judged this message a likely " + threat.lower() + " from its wording."]
     if not reasons:
         reasons = ["No scam warning signs were found in this message."]
 
@@ -526,6 +543,159 @@ def tri_classify(text, llm=None):
     }
 
 
+# =========================================================================== #
+# Accuracy fixes: far fewer false alarms on harmless messages.
+# The definitions below replace the earlier versions of the same names.
+# =========================================================================== #
+import inspect
+
+TRI_SAFE_DOMAINS = ("google.com", "youtube.com", "facebook.com", "whatsapp.com", "microsoft.com", "office.com",
+                    "live.com", "apple.com", "zoom.us", "github.com", "linkedin.com", "twitter.com", "x.com",
+                    "wikipedia.org", "gov.zw", "ac.zw", "nust.ac.zw")
+TRI_WARN_RE = re.compile(r"(do not|don't|dont|never)\s+(share|give|disclose|reveal)", re.I)
+TRI_CODE_RE = re.compile(r"\b(otp|pin|code|password|passcode)\b", re.I)
+TRI_BENIGN_CUES = re.compile(
+    r"\b(successful(ly)?|receipt|your (statement|balance|token|order|appointment|parcel)|thank you for|thanks for|"
+    r"see you|meeting|lecture|assignment|reminder|timetable|good (morning|afternoon|evening)|happy birthday|"
+    r"congratulations on|maintenance|delivered|workshop|attendance)\b", re.I)
+
+
+def _tri_under(host, domains):
+    return any(host == d or host.endswith("." + d) for d in domains)
+
+
+def tri_url_signals(text):
+    sigs, urls = [], []
+    for m in TRI_URL_RE.finditer(text):
+        raw = m.group(1).rstrip(".,;:!?)")
+        urls.append(raw)
+        host = _tri_host(raw)
+        if not host:
+            continue
+        official = _tri_under(host, TRI_OFFICIAL)
+        if any(b in host for b in TRI_BRANDS) and not official:
+            sigs.append((45, "Phishing", f"The link ({host}) imitates a known Zimbabwean brand but is not its real website."))
+        if official or _tri_under(host, TRI_SAFE_DOMAINS) or host.endswith(".edu"):
+            continue
+        sigs.append((4, "Malicious link", f"It contains a link ({host}) you didn't ask for."))
+        if host in TRI_SHORTENERS:
+            sigs.append((25, "Malicious link", f"{host} is a link shortener that hides the real destination."))
+        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+            sigs.append((35, "Malicious link", "The link points to a raw IP address instead of a real website name."))
+        if host.endswith(TRI_RISKY_TLDS):
+            sigs.append((25, "Malicious link", f"The link ends in a domain type ({host.rsplit('.', 1)[-1]}) often used for scams."))
+        if host.count("-") >= 2:
+            sigs.append((10, "Malicious link", "The web address is stuffed with hyphens, a typical fake-site pattern."))
+        if "@" in raw:
+            sigs.append((20, "Malicious link", "The link contains an '@', a trick to disguise the real site."))
+        if raw.lower().startswith("http://"):
+            sigs.append((4, "Malicious link", "The link is not encrypted (http, not https)."))
+    return sigs, urls
+
+
+def tri_rules_analyze(text):
+    """Noisy-OR of all signals -> 0-100 score, dominant threat type, reasons."""
+    otp_warning = bool(TRI_WARN_RE.search(text) and TRI_CODE_RE.search(text))
+    signals = []
+    for rid, rx, w, t, reason in _TRI_COMPILED:
+        if rid in ("credential_request", "secrecy") and otp_warning:
+            continue          # "Do not share your OTP with anyone" is a safety warning, not a scam
+        if rx.search(text):
+            signals.append((w, t, reason))
+    usigs, urls = tri_url_signals(text)
+    signals += usigs
+
+    seen, uniq = set(), []
+    for s in signals:
+        if s[2] not in seen:
+            seen.add(s[2])
+            uniq.append(s)
+    signals = sorted(uniq, key=lambda s: -s[0])
+
+    p = 1.0
+    for w, _, _ in signals:
+        p *= 1 - w / 100.0
+    score = min(98, round(100 * (1 - p)))
+    if score < 50 and TRI_BENIGN_CUES.search(text) and not any(w >= 40 for w, _, _ in signals):
+        score = round(score * 0.5)      # ordinary-looking wording and only weak signals
+
+    by_type = {}
+    for w, t, _ in signals:
+        if t:
+            by_type[t] = by_type.get(t, 0) + w
+    threat = max(by_type, key=by_type.get) if by_type else "Benign"
+    return {"score": score, "threat": threat, "reasons": [s[2] for s in signals], "urls": urls}
+
+
+_TRI_BRIEF_OK = "brief" in inspect.signature(tri_llm_analyze).parameters
+
+
+def _tri_call_llm(llm, text, hints, brief):
+    if _TRI_BRIEF_OK:
+        return tri_llm_analyze(llm, text, hints, brief)
+    return tri_llm_analyze(llm, text, hints)
+
+
+def tri_classify(text, llm=None, brief=False):
+    text = (text or "").strip()
+    if not text:
+        return {"error": "Empty message"}
+
+    r = tri_rules_analyze(text)
+    rs = r["score"]
+    l = _tri_call_llm(llm, text, r["reasons"], brief) if (llm is not None and rs < 70) else None
+
+    if l is None:
+        score, engine = rs, "Rules only (offline)"
+    else:
+        ls, lt = l["score"], l["threat_type"]
+        engine = "Rules + local AI (offline)"
+        if rs < 10:
+            # the rules saw nothing: a small model alone may only raise a Medium flag when it is very sure
+            score = 35 if (lt != "Benign" and ls >= 85) else min(round(ls * 0.25), 24)
+        else:
+            score = round(0.6 * rs + 0.4 * ls)
+            if lt == "Benign" and ls < 30 and rs < 45:
+                score = min(score, 25)      # the AI vetoes weak rule evidence
+
+    risk = tri_risk_from_score(score)
+    suspicious = score >= 30
+
+    if not suspicious:
+        threat = "Benign"
+    elif r["reasons"] and r["threat"] != "Benign":
+        threat = r["threat"]
+    elif l is not None and l["threat_type"] != "Benign":
+        threat = l["threat_type"]
+    else:
+        threat = "Phishing"
+
+    if suspicious:
+        reasons = list(r["reasons"][:4])
+        if l is not None and l.get("why") and l.get("suspicious") and l["why"] not in reasons:
+            reasons.append(l["why"])
+        if not reasons:
+            reasons = ["The local AI judged this message a likely " + threat.lower() + " from its wording."]
+    else:
+        reasons = [l["why"] if (l is not None and l.get("why") and not l.get("suspicious"))
+                   else "No clear scam signs were found: nothing here asks for money, a PIN or a password."]
+        if r["urls"]:
+            reasons.append("It contains a link, so open it only if you were expecting it.")
+
+    return {
+        "suspicious": suspicious,
+        "threat_type": threat,
+        "risk": risk,
+        "score": score,
+        "why": reasons[:4],
+        "action": tri_pick_action(threat, risk),
+        "engine": engine,
+        "rule_score": rs,
+        "ai_score": l["score"] if l else None,
+        "links_found": r["urls"],
+    }
+
+
 _TRI_CHECK_REQ = re.compile(
     r"\b(is|are) (this|these|it)\b.{0,40}\b(scam|phish\w*|fake|legit\w*|real|genuine|safe|suspicious|fraud\w*)\b"
     r"|\b(check|analy[sz]e|scan|verify)\b.{0,25}\b(this|message|sms|email|text|link|whatsapp)\b",
@@ -536,15 +706,45 @@ def tri_format(t):
     icon = {'High': '\U0001F534', 'Medium': '\U0001F7E0', 'Low': '\U0001F7E2'}.get(t['risk'], '')
     why = t['why'] if isinstance(t['why'], list) else [t['why']]
     lines = [
-        f"{icon} {t['risk'].upper()} RISK ({t['score']}/100)",
-        f"Verdict: {'Suspicious' if t['suspicious'] else 'Looks safe'}",
-        f"Threat type: {t['threat_type']}",
+        f"## {icon} {t['risk'].upper()} RISK ({t['score']}/100)",
+        f"**Verdict:** {'Suspicious' if t['suspicious'] else 'Looks safe'}",
+        f"**Threat type:** {t['threat_type']}",
         "",
-        "Why:",
+        "**Why**",
     ]
     lines += [f"- {w}" for w in why]
-    lines += ["", f"What to do: {t['action']}", "", f"({t['engine']})"]
+    lines += ["", f"**What to do:** {t['action']}", "", f"*{t['engine']}*"]
     return "\n".join(lines)
+
+
+def _quick_reply(message):
+    t = re.sub(r"[^a-z' ]", " ", message.lower()).split()
+    t = " ".join(t)
+    if re.fullmatch(r"(hi|hie|hello|hey|hi there|hello there|hey there|howdy|yo|sup|good (morning|afternoon|evening)|greetings)", t):
+        return ("Hi! I'm R3KON GPT, your offline cybersecurity assistant. "
+                "Ask me a security question, paste a suspicious message and I'll check it, or use the Upload CSV button to scan a whole file.")
+    if re.fullmatch(r"((hi|hello|hey) )?(how are you|how are you doing|how r u|how is it going|how s it going|whats up|what s up)( today)?", t):
+        return "I'm doing well, thanks for asking! What can I help you with?"
+    if re.fullmatch(r"(thanks|thank you|thank you so much|thanks a lot|thx|cheers)( r3kon)?", t):
+        return "You're welcome! Let me know if you want to check anything else."
+    return None
+
+
+def _ends_cleanly(s):
+    s = s.rstrip()
+    return bool(re.search(r"[.!?][\"')\]*]*$", s)) or s.endswith("```")
+
+
+def _tidy(text, capped):
+    """If a reply was cut by the length limit, drop the unfinished sentence and close any open code block."""
+    text = text.strip()
+    if capped and not _ends_cleanly(text):
+        cut = max(text.rfind('. '), text.rfind('.\n'), text.rfind('! '), text.rfind('? '), text.rfind('\n'))
+        if cut > len(text) * 0.5:
+            text = text[:cut + 1].rstrip()
+    if text.count('```') % 2 == 1:
+        text += '\n```'
+    return text
 
 
 def _norm_history(history):
@@ -592,6 +792,10 @@ def chat():
                 t = tri_classify(text, llm=llm)
             return jsonify({'response': tri_format(t), 'triage': t})
 
+        quick = _quick_reply(message)
+        if quick:
+            return jsonify({'response': quick})
+
         result = generate_response(message, config, history)
         if 'error' in result:
             return jsonify(result), 500
@@ -638,11 +842,17 @@ def chat_stream():
                 yield _ndjson({'done': True, 'response': out, 'triage': t})
                 return
 
+            quick = _quick_reply(message)
+            if quick:
+                yield _ndjson({'t': quick})
+                yield _ndjson({'done': True, 'response': quick})
+                return
+
             token_limits = {'short': None, 'detailed': 450, 'professional': 600}
             max_tokens = token_limits.get(config.get('responseLength', 'detailed'), 450) or 200
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
             if config.get('sessionMemory') and history:
-                for turn in history[-5:]:
+                for turn in history[-3:]:
                     if turn.get('user'):
                         messages.append({'role': 'user', 'content': turn['user']})
                     if turn.get('assistant'):
@@ -650,15 +860,23 @@ def chat_stream():
             messages.append({'role': 'user', 'content': message})
 
             parts = []
+            ntok = 0
+            finish = None
             with model_lock:
-                for chunk in llm.create_chat_completion(messages=messages, max_tokens=max_tokens,
+                for chunk in llm.create_chat_completion(messages=messages, max_tokens=max_tokens + 150,
                                                         temperature=0.7, top_p=0.9,
                                                         repeat_penalty=1.1, stream=True):
-                    piece = chunk['choices'][0]['delta'].get('content')
+                    ch = chunk['choices'][0]
+                    finish = ch.get('finish_reason') or finish
+                    piece = ch['delta'].get('content')
                     if piece:
                         parts.append(piece)
+                        ntok += 1
                         yield _ndjson({'t': piece})
-            yield _ndjson({'done': True, 'response': ''.join(parts).strip()})
+                        if ntok >= max_tokens and _ends_cleanly(''.join(parts[-4:])):
+                            break
+            print(f'[chat] {ntok} tokens, finish={finish}')
+            yield _ndjson({'done': True, 'response': _tidy(''.join(parts), ntok >= max_tokens)})
         except Exception as e:
             print(f'Error in stream endpoint: {e}')
             yield _ndjson({'error': str(e)})
@@ -683,6 +901,8 @@ def triage_batch():
     texts = texts[:5000]
     use_ai = data.get('mode') != 'fast' and model_loaded
 
+    cache = {}
+
     def gen():
         for i, tx in enumerate(texts):
             try:
@@ -690,11 +910,15 @@ def triage_batch():
                 if not tx:
                     yield _nd({'i': i, 'skip': True})
                     continue
-                if use_ai and tri_rules_analyze(tx)['score'] < 70:
+                if tx in cache:
+                    r = cache[tx]
+                elif use_ai and tri_rules_analyze(tx)['score'] < 70:
                     with model_lock:
-                        r = tri_classify(tx, llm=llm)
+                        r = tri_classify(tx, llm=llm, brief=True)
+                    cache[tx] = r
                 else:
                     r = tri_classify(tx, llm=None)
+                    cache[tx] = r
                 yield _nd({'i': i, 'r': r})
             except Exception as e:
                 yield _nd({'i': i, 'error': str(e)})
@@ -719,6 +943,19 @@ def csv_save():
         w.writerow(header)
         w.writerows(rows)
     return jsonify({'path': path, 'rows': len(rows)})
+
+
+@app.route('/api/report/save', methods=['POST'])
+def report_save():
+    data = request.get_json(silent=True) or {}
+    text = str(data.get('text') or '')
+    folder = os.path.join(BASE_PATH, 'reports')
+    os.makedirs(folder, exist_ok=True)
+    ref = re.sub(r'[^A-Za-z0-9_-]', '_', str(data.get('ref') or 'report'))[:60]
+    path = os.path.join(folder, ref + '.txt')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+    return jsonify({'path': path})
 
 
 def _analysis_route(fn, key, field):
